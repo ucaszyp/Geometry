@@ -1,65 +1,11 @@
 import numpy as np
 import os
 from PIL import Image
-import threading
 import random
 import scipy.io as sio
 import cv2
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-
-def accuracy(output, target):
-    """Computes the precision@k for the specified values of k"""
-    # batch_size = target.size(0) * target.size(1) * target.size(2)
-    _, pred = output.max(1)
-    pred = pred.view(1, -1)
-    target = target.view(1, -1)
-    correct = pred.eq(target)
-    correct = correct[target != 255]
-    correct = correct.view(-1)
-    try:
-        score = correct.float().sum(0).mul(100.0 / correct.size(0))
-        return score.item()
-    except:
-        return 0
-
-def mIoU(output, target):
-    """Computes the iou for the specified values of k"""
-    num_classes = output.shape[1]
-    hist = np.zeros((num_classes, num_classes))
-    _, pred = output.max(1)
-    pred = pred.cpu().data.numpy()
-    target = target.cpu().data.numpy()
-    hist += fast_hist(pred.flatten(), target.flatten(), num_classes)
-    ious = per_class_iu(hist) * 100
-    return round(np.nanmean(ious[1]), 2)
-
-def mIoUAll(output, target):
-    """Computes the iou for the specified values of k"""
-    num_classes = output.shape[1]
-    hist = np.zeros((num_classes, num_classes))
-    _, pred = output.max(1)
-    pred = pred.cpu().data.numpy()
-    target = target.cpu().data.numpy()
-    hist += fast_hist(pred.flatten(), target.flatten(), num_classes)
-    ious = per_class_iu(hist) * 100
-    return round(np.nanmean(ious), 2)
+import matplotlib.pyplot as plt
+import torch
 
 
 def adjust_learning_rate(args, optimizer, epoch):
@@ -79,68 +25,9 @@ def adjust_learning_rate(args, optimizer, epoch):
     
     return lr
 
-def fast_hist(pred, label, n):
-    k = (label >= 0) & (label < n)
-    return np.bincount(
-        n * label[k].astype(int) + pred[k], minlength=n ** 2).reshape(n, n)
-
-
-def per_class_iu(hist):
-    return np.diag(hist) / (hist.sum(1) + hist.sum(0) - np.diag(hist))
-
-def save_output_images(predictions, filenames, output_dir):
-    """
-    Saves a given (B x C x H x W) into an image file.
-    If given a mini-batch tensor, will save the tensor as a grid of images.
-    """
-    # pdb.set_trace()
-    for ind in range(len(filenames)):
-        im = Image.fromarray(predictions[ind].astype(np.uint8))
-        fn = os.path.join(output_dir, filenames[ind][:-4] + '.png')
-        out_dir = os.path.split(fn)[0]
-        if not os.path.exists(out_dir):
-            os.makedirs(out_dir)
-        im.save(fn)
-
-def save_colorful_images(predictions, filenames, output_dir, palettes):
-    """
-    Saves a given (B x C x H x W) into an image file.
-    If given a mini-batch tensor, will save the tensor as a grid of images.
-    """
-    for ind in range(len(filenames)):
-        im = Image.fromarray(palettes[predictions[ind].squeeze()])
-        fn = os.path.join(output_dir, filenames[ind][:-4] + '.png')
-        out_dir = os.path.split(fn)[0]
-        if not os.path.exists(out_dir):
-            os.makedirs(out_dir)
-        im.save(fn)
-
-def resize_4d_tensor(tensor, width, height):
-    tensor_cpu = tensor.cpu().numpy()
-    if tensor.size(2) == height and tensor.size(3) == width:
-        return tensor_cpu
-    out_size = (tensor.size(0), tensor.size(1), height, width)
-    out = np.empty(out_size, dtype=np.float32)
-
-    def resize_one(i, j):
-        out[i, j] = np.array(
-            Image.fromarray(tensor_cpu[i, j]).resize(
-                (width, height), Image.BILINEAR))
-
-    def resize_channel(j):
-        for i in range(tensor.size(0)):
-            out[i, j] = np.array(
-                Image.fromarray(tensor_cpu[i, j]).resize(
-                    (width, height), Image.BILINEAR))
-
-    workers = [threading.Thread(target=resize_channel, args=(j,))
-               for j in range(tensor.size(1))]
-    for w in workers:
-        w.start()
-    for w in workers:
-        w.join()
-    return out
-
+def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+    if is_best:
+        torch.save(state, filename)
 
 def random_crop(img, norm, norm_mask, height, width):
     """randomly crop the input image & surface normal
@@ -245,61 +132,64 @@ def log_depth_errors(metrics, where_to_write, first_line):
         metrics['silog'], metrics['abs_rel'], metrics['log10'], metrics['rms'], 
         metrics['sq_rel'], metrics['log_rms'], metrics['d1'], metrics['d2'], metrics['d3'],))
 
-def vis(img, depth_list, pred_list, gt, depth_mask, index):
-    for i in range(len(depth_list)):
-        save_img = "vis/img/"
-        save_pred = "vis/pred/{}/".format(i)
-        save_sigma = "vis/sigma/{}/".format(i)
-        save_gt = "vis/gt/"
-        save_mask = "vis/mask/"
-        if not os.path.exists(save_img):
-            os.makedirs(save_img)
-        if not os.path.exists(save_pred):
-            os.makedirs(save_pred)
-        if not os.path.exists(save_sigma):
-            os.makedirs(save_sigma)
-        if not os.path.exists(save_gt):
-            os.makedirs(save_gt)
-        if not os.path.exists(save_mask):
-            os.makedirs(save_mask)
+def vis(args, img_path, pred_list, gt, index, sub_epoch):
+    save_dir = "./vis_{}/{}".format(args.task, "%04d" %sub_epoch)
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
 
-        save_pred = os.path.join(save_pred, "%04d" %index + ".mat")
-        save_sigma = os.path.join(save_sigma, "%04d" %index + ".mat")
-        save_gt = os.path.join(save_gt, "%04d" %index + ".mat")
-        save_mask = os.path.join(save_mask, "%04d" %index + ".mat")
-        save_img = os.path.join(save_img, "%04d" %index + ".jpg")
-        
-        if i == 3:
-            depth = depth_list[i]
-            pred = pred_list[i]
-            pred_depth = pred_sigma = None
-            # depth = depth[0][0].detach().cpu().numpy()
-            # if i == 0:
-            pred_depth, pred_sigma = depth[:, 0:1, :, :], depth[:, 1:, :, :]
-            pred_depth.clamp(max=8.0, min=0.001)
-            pred_depth = pred_depth[0][0].detach().cpu().numpy()
-            pred_sigma = pred_sigma[0][0].detach().cpu().numpy()
+    save_file = os.path.join(save_dir, "%04d" %index + ".jpg")
+    pred_depth = pred_sigma = pred_norm = pred_kappa = None
+    pred_output = pred_uncertain = None
+    pred = pred_list[-1]
+    if args.task == "depth":
+        pred_depth, pred_sigma = pred[:, 0:1, :, :], pred[:, 1:, :, :]
+        pred_depth.clamp(max=10.0, min=0.001)
+        pred_depth = pred_depth[0][0].detach().cpu().numpy()
+        pred_output = pred_depth
+        pred_sigma = torch.exp(pred_sigma)
+        pred_uncertain = pred_sigma
+        pred_sigma = pred_sigma[0][0].detach().cpu().numpy()
+        gt = gt[0][0].detach().cpu().numpy()
+    
+    elif args.task == "normal":
+        pred_norm, pred_kappa = pred[:, 0:3, :, :], pred[:, 3:, :, :]
+        pred_norm = pred_norm[0].detach().cpu().numpy()
+        pred_norm = ((pred_norm + 1) / 2) * 255
+        pred_output = pred_norm
+        pred_kappa = pred_kappa[0][0].detach().cpu().numpy()
+        pred_uncertain = pred_kappa
+        gt = gt[0].detach().cpu().numpy()
+        gt = ((gt + 1) / 2) * 255       
 
-            img = img[0].detach().cpu().numpy()
-            img = img.transpose(1,2,0)
-            img = (img * 255).astype(np.uint8)
-            img = img[:,:,::-1]
-            gt = gt[0][0].detach().cpu().numpy()
-            mask = depth_mask[0][0].detach().cpu().numpy()
-            sio.savemat(save_gt, {"gt": gt})
-            sio.savemat(save_mask, {"mask": mask})
-            sio.savemat(save_pred, {"pred_depth": pred_depth})
-            sio.savemat(save_sigma, {"pred_sigma": pred_sigma})
-            cv2.imwrite(save_img, img)
+    img = plt.imread(img_path)
+     
+    plt.subplot(221)
+    plt.axis("equal")
+    plt.axis("off")
+    plt.imshow(img)
 
-        # else:
-        #     pred_depth, pred_sigma = pred[:, 0:1, :], pred[:, 1:, :]
+    plt.subplot(222)
+    plt.axis("equal")
+    plt.axis("off")
+    plt.imshow(pred_output)
 
-            print(depth.shape)
-            print(pred_depth.shape)
-            print(pred_sigma.shape)
-            print(gt.shape)
-            print(mask.shape)
-        # sio.savemat(save_depth, {"depth": depth})
+    plt.subplot(223)
+    plt.axis("equal")
+    plt.axis("off")
+    plt.imshow(pred_uncertain)
+
+    plt.subplot(224)
+    plt.axis("equal")
+    plt.axis("off")
+    plt.imshow(gt)
+
+    plt.savefig(save_file, dpi=400, bbox_inches='tight')
+    plt.close()
+
+            
+
+
+
+
 
 

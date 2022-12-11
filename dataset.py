@@ -146,8 +146,9 @@ class Depth_Single(torch.utils.data.Dataset):
 
         sample = {'img': img,
                     'depth': depth_gt,
-                    'depth_valid_mask': depth_valid_mask,
-                    'path': img_path}
+                    'depth_valid_mask': depth_valid_mask, 
+                    'img_path': img_path}
+
 
         return sample
 
@@ -166,8 +167,6 @@ class Depth_Single(torch.utils.data.Dataset):
     def rotate_image(self, img, angle, flag=Image.BILINEAR):
         result = img.rotate(angle, resample=flag)
         return result
-
-
 
 class Normal_Single(torch.utils.data.Dataset):
     def __init__(self, args, data_dir, phase):
@@ -245,7 +244,8 @@ class Normal_Single(torch.utils.data.Dataset):
 
         sample = {'img': img,
                     'norm': norm_gt,
-                    'norm_valid_mask': norm_valid_mask}
+                    'norm_valid_mask': norm_valid_mask,
+                    'img_path': img_path}
 
         return sample
 
@@ -261,8 +261,6 @@ class Normal_Single(torch.utils.data.Dataset):
         if exists(label_path):
             self.label_list = [line.strip() for line in open(label_path, 'r')]
             assert len(self.image_list) == len(self.label_list)
-
-
 
 class Seg_Single(torch.utils.data.Dataset):
     def __init__(self, data_dir, phase, transforms, list_dir=None,
@@ -307,7 +305,6 @@ class Seg_Single(torch.utils.data.Dataset):
         if exists(label_path):
             self.label_list = [line.strip() for line in open(label_path, 'r')]
             assert len(self.image_list) == len(self.label_list)
-
 
 class SegListMS(torch.utils.data.Dataset):
     def __init__(self, data_dir, phase, transforms, scales, list_dir=None):

@@ -2,45 +2,29 @@
 # -*- coding: utf-8 -*-
 
 import argparse
-import json
 import logging
-import math
 import os
-# import pdb
-from os.path import exists, join, split
-import threading
+from os.path import exists, join
 from datetime import datetime
-
-import time
 
 import numpy as np
 import shutil
 
 from tqdm import tqdm
 import sys
-from PIL import Image
 import torch
 from torch import nn
 import torch.backends.cudnn as cudnn
-from torch.nn.modules import transformer
-import torch.optim as optim
-from torchvision import datasets, transforms
-from torch.autograd import Variable
 from tensorboardX import SummaryWriter
+import torch.distributed as dist
+import torch.utils.data.distributed
 
-from min_norm_solvers import MinNormSolver
 import torch.nn.functional as F
 
-import data_transforms as d_transforms
-from model.models import DPTSegmentationModel, DPTDepthModel, DPTNormalModel, DPTDepthUncertainModel, DepthUncertainModel
-from model.transforms import PrepareForNet
+from model.models import DPTDepthModel, DPTNormalUncertainModel, DPTDepthUncertainModel
 from utils import *
 from dataset import *
-from losses import compute_loss, silog_loss, aleatoric_loss
-
-
-FORMAT = "[%(asctime)-15s %(filename)s:%(lineno)d %(funcName)s] %(message)s"
-logging.basicConfig(format=FORMAT, filename='./'+ datetime.now().strftime("%Y%m%d_%H%M%S") + '.txt')
+from losses import compute_loss, silog_loss
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -48,19 +32,21 @@ logger.setLevel(logging.DEBUG)
 task_list = None
 middle_task_list = None
 
-def validate_normal(args, val_loader, model, epoch):
+def validate_normal(args, val_loader, model, total_iter):
     print("=============validation begin==============")
     val_loader = tqdm(val_loader, desc="Loop: Validation")
     model.eval()
+    sub_epoch = total_iter / (args.val_freq * args.batch_size)
     with torch.no_grad():
         total_normal_errors = None
         
-        for data_dict in val_loader:
+        for i, data_dict in enumerate(val_loader):
 
             # data to device
             img = data_dict['img'].cuda()
             gt_norm = data_dict['norm'].cuda()
             gt_norm_mask = data_dict['norm_valid_mask'].cuda()
+            img_path = data_dict['img_path'][0]
 
             # forward pass
 
@@ -73,6 +59,8 @@ def validate_normal(args, val_loader, model, epoch):
 
             pred_norm = norm_out[:, :3, :, :]  # (B, 3, H, W)
             pred_kappa = norm_out[:, 3:, :, :]  # (B, 1, H, W)
+            if dist.get_rank()== 0 and args.vis and sub_epoch % 5 == 0:
+                vis(args, img_path, norm_out_list, gt_norm, i, sub_epoch)
 
             prediction_error = torch.cosine_similarity(pred_norm, gt_norm, dim=1)
             prediction_error = torch.clamp(prediction_error, min=-1.0, max=1.0)
@@ -87,42 +75,41 @@ def validate_normal(args, val_loader, model, epoch):
         total_normal_errors = total_normal_errors.data.cpu().numpy()
         metrics = compute_normal_errors(total_normal_errors)
         log_path = join(args.log_dir, "eval.txt")
-        log_normal_errors(metrics, log_path, first_line='epoch: {}'.format(epoch + 1))    
+        if args.loacl_rank == 0:
+            log_normal_errors(metrics, log_path, first_line='epoch: {}'.format(sub_epoch + 1))    
 
         return metrics
 
-def validate_depth(args, val_loader, model, epoch):
+def validate_depth(args, val_loader, model, total_iter):
     print("=============validation begin==============")
     val_loader = tqdm(val_loader, desc="Loop: Validation")
     model.eval()
     depth_metrics = {'silog': [], 'abs_rel': [], 'log10': [], 'rms': [], 'sq_rel': [], 
                     'log_rms': [], 'd1': [], 'd2': [], 'd3': []}
+    sub_epoch = total_iter / (args.val_freq * args.batch_size)
 
     with torch.no_grad():    
-        for data_dict in val_loader:
+        for i, data_dict in enumerate(val_loader):
 
             # data to device
             img = data_dict['img'].cuda()
             gt_depth = data_dict['depth'].cuda()
             gt_depth_mask = data_dict['depth_valid_mask'].cuda()
+            img_path = data_dict['img_path'][0]
             
             if args.use_uncertain == 0:
                 pred_depth = model(img)
                 pred_depth = nn.functional.interpolate(pred_depth, size=[gt_depth.size(2), gt_depth.size(3)],
                                                     mode='bilinear', align_corners=True)
-            elif args.use_uncertain:
-                if args.uncertain_all:
-                    pred = model(img)
-                    pred_depth = pred[:, 0:1, :, :]
-                    pred_depth = nn.functional.interpolate(pred_depth, size=[gt_depth.size(2), gt_depth.size(3)],
-                                    mode='bilinear', align_corners=True)     
-                else:
-                    out_depth_list, pred_list, _ = model(img, gt_depth_mask, mode='val')
-                    out_depth = out_depth_list[-1]
+            elif args.use_uncertain:   
+                out_depth_list, pred_list, _ = model(img, gt_depth_mask, mode='val')
+                out_depth = out_depth_list[-1]
 
-                    out_depth = nn.functional.interpolate(out_depth, size=[gt_depth.size(2), gt_depth.size(3)],
-                                                        mode='bilinear', align_corners=True)
-                    pred_depth = out_depth[:, 0:1, :, :]
+                out_depth = nn.functional.interpolate(out_depth, size=[gt_depth.size(2), gt_depth.size(3)],
+                                                    mode='bilinear', align_corners=True)
+                pred_depth = out_depth[:, 0:1, :, :]
+                if dist.get_rank()== 0 and args.vis and sub_epoch % 5 == 0:
+                    vis(args, img_path, out_depth_list, gt_depth, i, sub_epoch)
             
             pred_depth = pred_depth.cpu().numpy().squeeze()
             gt_depth = gt_depth.cpu().numpy().squeeze()
@@ -140,20 +127,21 @@ def validate_depth(args, val_loader, model, epoch):
 
         depth_metrics = {k: np.mean(v).item() for k, v in depth_metrics.items()}
         log_path = join(args.log_dir, "eval.txt")
-        log_depth_errors(depth_metrics, log_path, first_line='epoch: {}'.format(epoch + 1)) 
+        if args.loacl_rank == 0:
+            log_depth_errors(depth_metrics, log_path, first_line='epoch: {}'.format(sub_epoch + 1)) 
 
         return metrics
 
-
 def train_normal(args, train_loader, val_loader, model, criterion, optimizer, epoch, best_prec, train_writer):
     prec1 = 0
+    local_rank = args.local_rank
     train_loader = tqdm(train_loader, desc=f"Epoch: {epoch + 1}/{args.epochs}. Loop: Train Normal")
     model.train()
     for i, data_dict in enumerate(train_loader):
         
-        img = data_dict['img'].cuda()
-        gt_norm = data_dict['norm'].cuda()
-        gt_norm_mask = data_dict['norm_valid_mask'].cuda()
+        img = data_dict['img'].clone().cuda(local_rank, non_blocking=True)
+        gt_norm = data_dict['norm'].clone().cuda(local_rank, non_blocking=True)
+        gt_norm_mask = data_dict['norm_valid_mask'].clone().cuda(local_rank, non_blocking=True)
 
         _, pred_list, coord_list = model(img, gt_norm_mask=gt_norm_mask, mode='train')
         loss = criterion(pred_list, coord_list, gt_norm, gt_norm_mask)
@@ -165,114 +153,116 @@ def train_normal(args, train_loader, val_loader, model, criterion, optimizer, ep
         optimizer.step()
 
         total_iter = epoch * len(train_loader) + i
-        train_writer.add_scalar('train_normal_loss', loss.item(), total_iter)
+        if local_rank == 0:
+            train_writer.add_scalar('train_normal_loss', loss.item(), total_iter)
 
-        if total_iter % (50 * args.batch_size) == 0 and total_iter > 0:
-            is_best = 0
-            metrics = validate_normal(args, val_loader, model, epoch)
-            prec1 = metrics["a1"]
-            if prec1 > best_prec:
-                best_prec = prec1
-                is_best = 1
+            if total_iter % (args.val_freq * args.batch_size) == 0 and total_iter > 0:
+                is_best = 0
+                metrics = validate_normal(args, val_loader, model, total_iter)
+                prec1 = metrics["a1"]
+                if prec1 > best_prec:
+                    best_prec = prec1
+                    is_best = 1
+            
+                checkpoint_path = join(args.log_dir, 'model_best.pth.tar')
+
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'best_prec1': best_prec,
+                }, is_best, filename=checkpoint_path)
         
-            checkpoint_path = join(args.log_dir, 'model_best.pth.tar')
-
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'best_prec1': best_prec,
-            }, is_best, filename=checkpoint_path)
-        
-        return best_prec 
-
+    return best_prec 
 
 def train_depth(args, train_loader, val_loader, model, criterion, optimizer, epoch, best_prec, train_writer):
     prec1 = 0
-    
+
+    local_rank = args.local_rank
     train_loader = tqdm(train_loader, desc=f"Epoch: {epoch + 1}/{args.epochs}. Loop: Train Depth")
     model.train()
     loss = 0
     for i, data_dict in enumerate(train_loader):
 
-        img = data_dict['img'].cuda()
-        gt_depth = data_dict['depth'].cuda()
-        gt_depth_mask = data_dict['depth_valid_mask'].cuda()
+        img = data_dict['img'].clone().cuda(local_rank, non_blocking=True)
+        gt_depth = data_dict['depth'].clone().cuda(local_rank, non_blocking=True)
+        gt_depth_mask = data_dict['depth_valid_mask'].clone().cuda(local_rank, non_blocking=True)
 
         if args.use_uncertain:
-            if args.uncertain_all:
-                pred = model(img)
-                loss = criterion(pred, gt_depth, gt_depth_mask)
-            else:
-                depth_list, pred_list, coord_list = model(img, gt_depth_mask, mode='train')
-                if args.vis:
-                    vis(img, depth_list, pred_list, gt_depth, gt_depth_mask, i)
-                loss = criterion(pred_list, coord_list, gt_depth, gt_depth_mask)
+            depth_list, pred_list, coord_list = model(img, gt_depth_mask, mode='train')
+            loss = criterion(pred_list, coord_list, gt_depth, gt_depth_mask)
         
         else:
             depth_est = model(img)
             loss = criterion(depth_est, gt_depth, gt_depth_mask)
         loss_ = float(loss.data.cpu().numpy())
-        train_loader.set_description(f"Epoch: {epoch + 1}/{args.epochs}. Loop: Train. Loss: {'%.5f' % loss_}")
+        if local_rank == 0:
+            train_loader.set_description(f"Epoch: {epoch + 1}/{args.epochs}. Loop: Train. Loss: {'%.5f' % loss_}")
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         total_iter = epoch * len(train_loader) + i
-        train_writer.add_scalar('train_depth_loss', loss.item(), total_iter)
+        if dist.get_rank() == 0:
+            train_writer.add_scalar('train_depth_loss', loss.item(), total_iter)
 
-        if total_iter % (50 * args.batch_size) == 0 and total_iter > 0:
+        if total_iter % (args.val_freq * args.batch_size) == 0 and total_iter > 0:
             is_best = 0
-            metrics = validate_depth(args, val_loader, model, epoch)
+            metrics = validate_depth(args, val_loader, model, total_iter)
             prec1 = metrics["d1"]
             if prec1 > best_prec:
                 best_prec = prec1
                 is_best = 1
-        
-            checkpoint_path = join(args.log_dir, "model_best.pth.tar")
 
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'best_prec1': best_prec,
-            }, is_best, filename=checkpoint_path)
-
+            if local_rank == 0:
+                checkpoint_path = join(args.log_dir, "model_best.pth.tar")
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'best_prec1': best_prec,
+                }, is_best, filename=checkpoint_path)
+ 
     return best_prec 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    if is_best:
-        torch.save(state, filename)
-
-
 def train_single(args):
+    
+    local_rank = args.local_rank
+    dist.init_process_group(backend='nccl')
+    torch.cuda.set_device(local_rank)
+    assert local_rank == dist.get_rank()
     batch_size = args.batch_size
     num_workers = args.workers
 
-    print(' '.join(sys.argv))
-
-    for k, v in args.__dict__.items():
-        print(k, ':', v)
-
-    train_writer = SummaryWriter(args.log_dir)
+    if local_rank == 0:
+        if not exists(args.log_dir):
+            os.makedirs(args.log_dir)
+        print(' '.join(sys.argv))
+        print(args)
+        train_writer = SummaryWriter(args.log_dir)
+        print(' '.join(sys.argv))
+        for k, v in args.__dict__.items():
+            print(k, ':', v)
+        shutil.copyfile("./run.sh", join(args.log_dir, "run.sh"))
+    else:
+        train_writer = None
     
     single_model = None
     criterion = None
 
     if args.task == "normal":
-        single_model = DPTNormalModel(args.classes, backbone="vitb_rn50_384", sampling_ratio=0.4, importance_ratio=0.7)
+        single_model = DPTNormalUncertainModel(backbone="vitb_rn50_384", sampling_ratio=0.4, importance_ratio=0.7)
 
     if args.task == "depth":
         if args.use_uncertain:
-            if args.uncertain_all:
-                single_model = DepthUncertainModel(backbone="vitb_rn50_384")
-            else:
-                single_model = DPTDepthUncertainModel(args.classes, backbone="vitb_rn50_384", sampling_ratio=0.3, importance_ratio=0.6)   
+            single_model = DPTDepthUncertainModel(backbone="vitb_rn50_384", sampling_ratio=0.3, importance_ratio=0.6)   
         else:    
             single_model = DPTDepthModel(backbone="vitb_rn50_384")
     
-    model = single_model.cuda()
+    single_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(single_model).cuda(local_rank)
+    single_model = torch.nn.parallel.DistributedDataParallel(single_model, device_ids=[local_rank], find_unused_parameters=True, broadcast_buffers=True)
+    model = single_model.cuda(local_rank)
 
 
     if args.task == "normal":
@@ -280,22 +270,20 @@ def train_single(args):
 
     if args.task == 'depth':
         if args.use_uncertain:
-            if args.uncertain_all:
-                criterion = aleatoric_loss(args)
-            else:
-                criterion = compute_loss(args)
+            criterion = compute_loss(args)
         else:
             criterion = silog_loss(args)
-    criterion.cuda()
+    criterion.cuda(local_rank)
 
     # Data loading code
     data_dir = args.data_dir
 
     if args.task == "normal": 
+        train_set = Normal_Single(args, data_dir, 'train')    
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_set)
         train_loader = torch.utils.data.DataLoader(
-            Normal_Single(args, data_dir, 'train'),
-            batch_size=batch_size, shuffle=True, num_workers=num_workers,
-            pin_memory=True, drop_last=True
+            train_set, batch_size=batch_size, num_workers=num_workers,
+            pin_memory=True, drop_last=True, sampler=train_sampler
         )
 
         val_loader = torch.utils.data.DataLoader(
@@ -304,11 +292,12 @@ def train_single(args):
             pin_memory=True
         )
 
-    if args.task == "depth": 
+    if args.task == "depth":
+        train_set = Depth_Single(args, data_dir, 'train')
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_set)
         train_loader = torch.utils.data.DataLoader(
-            Depth_Single(args, data_dir, 'train'),
-            batch_size=batch_size, shuffle=True, num_workers=num_workers,
-            pin_memory=True, drop_last=True
+            train_set, batch_size=batch_size, num_workers=num_workers,
+            pin_memory=True, drop_last=True, sampler=train_sampler
         )
 
         val_loader = torch.utils.data.DataLoader(
@@ -318,7 +307,7 @@ def train_single(args):
         )
 
     # define loss function (criterion) and pptimizer
-    optimizer = torch.optim.SGD(single_model.parameters(),
+    optimizer = torch.optim.SGD(model.parameters(),
                                 args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
@@ -355,7 +344,8 @@ def train_single(args):
 
     for epoch in range(start_epoch, args.epochs):
         lr = adjust_learning_rate(args, optimizer, epoch)
-        logger.info('Epoch: [{0}]\tlr {1:.06f}'.format(epoch, lr))
+        if local_rank == 0:
+            logger.info('Epoch: [{0}]\tlr {1:.06f}'.format(epoch, lr))
         # train for one epoch
 
         if args.task == "normal": 
@@ -364,26 +354,11 @@ def train_single(args):
         if args.task == "depth":
             best_prec = train_depth(args, train_loader, val_loader, model, criterion, optimizer, epoch, best_prec, train_writer)
 
-            
-        # evaluate on validation set
-            
-        # is_best = prec1 > best_prec1
-        # best_prec1 = max(prec1, best_prec1)
-        # checkpoint_path = './exp_logs/models/model_best.pth.tar'
-
-        # save_checkpoint({
-        #     'epoch': epoch + 1,
-        #     'arch': args.arch,
-        #     'state_dict': model.state_dict(),
-        #     'best_prec1': best_prec1,
-        # }, is_best, filename=checkpoint_path)
-
 def parse_args():
     # Training settings
     parser = argparse.ArgumentParser(description='')
     parser.add_argument('cmd', choices=['single', 'multi'])
     parser.add_argument('-d', '--data-dir', default='../dataset/nyud2')
-    parser.add_argument('-c', '--classes', default=0, type=int)
     parser.add_argument('-s', '--crop-size', default=0, type=int)
     parser.add_argument('--step', type=int, default=200)
     parser.add_argument('--arch')
@@ -426,17 +401,13 @@ def parse_args():
     parser.add_argument('--min_depth_eval', type=float, help='minimum depth for evaluation', default=1e-3)
     parser.add_argument('--max_depth_eval', type=float, help='maximum depth for evaluation', default=10.0)
     parser.add_argument('--degree', type=float, help='random rotation maximum degree', default=2.5)
-    parser.add_argument('--uncertain_all', type=int, default=0)
     parser.add_argument('--vis', type=int, default=0)
     parser.add_argument('--log-dir', type=str, default="./exp_logs")
+    parser.add_argument("--local_rank", type=int)
+    parser.add_argument("--val_freq", type=int, default=200)
 
     args = parser.parse_args()
-    args.log_dir = join(args.log_dir, datetime.now().strftime("%Y%m%d_%H%M%S")) 
-    if not exists(args.log_dir):
-        os.makedirs(args.log_dir)
-    args.classes = 42 
-    print(' '.join(sys.argv))
-    print(args)
+    args.log_dir = join(args.log_dir, datetime.now().strftime("%Y%m%d_%H%M%S"))
 
     return args
 
@@ -449,7 +420,7 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
     torch.autograd.set_detect_anomaly(True)
-    shutil.copyfile("./run.sh", join(args.log_dir, "run.sh"))
+    
     if args.cmd == 'single':
         train_single(args)
 
